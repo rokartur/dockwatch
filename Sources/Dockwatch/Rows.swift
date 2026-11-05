@@ -218,8 +218,15 @@ final class GroupCell: RowCell {
     private let cpu = figure(width: ContainerCell.cpuWidth)
     private let memory = figure(width: ContainerCell.memoryWidth)
     private var spoken: [String] = []
+    private let actions = NSStackView()
+    private let start: NSButton
+    private let stop: NSButton
 
-    init(toggleTarget: AnyObject, action: Selector) {
+    init(toggleTarget: AnyObject, action: Selector, actionTarget: MainWindowController?) {
+        start = actionButton("play.fill", "Start All", actionTarget, #selector(MainWindowController.startContainer(_:)))
+        stop = actionButton("stop.fill", "Stop All", actionTarget, #selector(MainWindowController.stopContainer(_:)))
+        let restart = actionButton("arrow.clockwise", "Restart All", actionTarget, #selector(MainWindowController.restartContainer(_:)))
+        let remove = actionButton("trash", "Remove Project", actionTarget, #selector(MainWindowController.removeSelected(_:)))
         super.init(frame: .zero)
         textField = title
         chevron.isBordered = false
@@ -229,8 +236,13 @@ final class GroupCell: RowCell {
         chevron.contentTintColor = .secondaryLabelColor
         chevron.translatesAutoresizingMaskIntoConstraints = false
         addSubview(chevron)
-        buttons = [chevron]
-        let leading = layoutRow(self, icon: icon, title: title, subtitle: summary, trailing: [cpu, memory])
+        buttons = [chevron, start, stop, restart, remove]
+        for view in buttons.dropFirst() {
+            actions.addArrangedSubview(view)
+        }
+        actions.spacing = 2
+        actions.setHuggingPriority(.required, for: .horizontal)
+        let leading = layoutRow(self, icon: icon, title: title, subtitle: summary, trailing: [actions, cpu, memory])
         leading.constant = 24
         NSLayoutConstraint.activate([
             chevron.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
@@ -242,8 +254,11 @@ final class GroupCell: RowCell {
         fatalError("init(coder:) is not used")
     }
 
-    func show(project: String, members: [Container], collapsed: Bool, latest: [Sample]) {
+    func show(project: String, members: [Container], collapsed: Bool, latest: [Sample], selected: Bool) {
         let running = members.filter(\.running).count
+        actions.isHidden = !selected
+        start.isHidden = running == members.count
+        stop.isHidden = running == 0
         let toggle = collapsed ? "Expand \(project)" : "Collapse \(project)"
         chevron.image = NSImage(
             systemSymbolName: collapsed ? "chevron.right" : "chevron.down", accessibilityDescription: toggle

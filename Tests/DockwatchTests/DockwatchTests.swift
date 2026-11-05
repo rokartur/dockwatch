@@ -123,6 +123,19 @@ private func container(_ name: String, project: String?, running: Bool = true) -
     #expect(rows.map { $0.id ?? "header" } == ["a", "b"])
 }
 
+@Test func composeStartBatchesFollowDependsOn() {
+    func service(_ name: String, _ dependsOn: [String] = []) -> Container {
+        var member = container(name, project: "shop")
+        member.service = name
+        member.dependsOn = dependsOn
+        return member
+    }
+    let batches = startBatches([service("web", ["php", "redis"]), service("php", ["db"]), service("db"), service("redis"), service("worker", ["gone"])])
+    #expect(batches.map { $0.map(\.name) } == [["db", "redis", "worker"], ["php"], ["web"]])
+    let cycle = startBatches([service("a", ["b"]), service("b", ["a"]), service("c")])
+    #expect(cycle.map { $0.map(\.name) } == [["c"], ["a", "b"]])
+}
+
 @Test func imagesSplitIntoInUseAndUnusedBySizeCountingSharedBytesOnce() {
     func image(_ reference: String, id: String, size: Int64) -> Image {
         Image(reference: reference, id: id, name: reference, tag: "", created: .now, size: size)
@@ -276,8 +289,26 @@ private func container(_ name: String, project: String?, running: Bool = true) -
 }
 
 @Test func terminalScriptQuotesSocketAndID() {
-    let script = terminalScript(socket: "/Users/o'neil/.lighter/docker.sock", containerID: "abc123")
+    let script = terminalScript(socket: "/Users/o'neil/.lighter/docker.sock", containerID: "abc123", dockerPath: "")
     #expect(script.contains(#"export DOCKER_HOST='unix:///Users/o'\''neil/.lighter/docker.sock'"#))
     #expect(script.contains("exec docker exec -it 'abc123' sh -c"))
     #expect(script.hasPrefix("#!/bin/sh\nrm -f \"$0\"\n"))
+}
+
+@Test func terminalScriptQuotesDockerPath() {
+    let script = terminalScript(socket: "/var/run/docker.sock", containerID: "abc123", dockerPath: "/My Tools/docker")
+    #expect(script.contains("exec '/My Tools/docker' exec -it 'abc123' sh -c"))
+}
+
+@Test func launchRuntimePrefersRunningPreferredSocket() {
+    let runtimes = [
+        Runtime(name: "Lighter", socket: "/l.sock", running: true),
+        Runtime(name: "OrbStack", socket: "/o.sock", running: true, current: true),
+        Runtime(name: "Colima", socket: "/c.sock", running: false),
+    ]
+    #expect(launchRuntime(runtimes, preferred: "/l.sock")?.name == "Lighter")
+    #expect(launchRuntime(runtimes, preferred: "/c.sock")?.name == "OrbStack")
+    #expect(launchRuntime(runtimes, preferred: nil)?.name == "OrbStack")
+    #expect(launchRuntime([runtimes[2], runtimes[0]], preferred: "/gone.sock")?.name == "Lighter")
+    #expect(launchRuntime([runtimes[2]], preferred: "/c.sock") == nil)
 }

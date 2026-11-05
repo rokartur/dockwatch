@@ -18,7 +18,6 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
     private var pendingLines: [LogLine] = []
     private var flushScheduled = false
     private var filter = ""
-    private var showTimestamps = true
     private var history = StatsHistory()
     private var env: [(key: String, value: String)] = []
 
@@ -160,7 +159,7 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
     }
 
     func toggleTimestamps() {
-        showTimestamps.toggle()
+        UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: "hideLogTimestamps"), forKey: "hideLogTimestamps")
         renderLogs()
     }
 
@@ -244,6 +243,7 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
         let text = NSMutableAttributedString()
         let timeAttributes: [NSAttributedString.Key: Any] = [.font: monospaced, .foregroundColor: NSColor.secondaryLabelColor]
         let textAttributes: [NSAttributedString.Key: Any] = [.font: monospaced, .foregroundColor: NSColor.textColor]
+        let showTimestamps = !UserDefaults.standard.bool(forKey: "hideLogTimestamps")
         for line in lines where logLineMatches(line, filter) {
             if showTimestamps {
                 text.append(NSAttributedString(string: line.time + " ", attributes: timeAttributes))
