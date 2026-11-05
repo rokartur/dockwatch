@@ -15,10 +15,10 @@ app=$out/Dockwatch.app
 dmg=$out/Dockwatch-$version.dmg
 
 # One native build per arch: the default build system and multi-arch builds stamp the
-# binary with SDK 14, and macOS then skips the macOS 26 design (Liquid Glass) for it.
+# binary with an old SDK version, and macOS then skips the macOS 26 design (Liquid Glass) for it.
 for arch in arm64 x86_64; do
 	SDKROOT=macosx swift build -c release --build-system native \
-		--triple "$arch-apple-macosx14.0" --scratch-path ".build/$arch"
+		--triple "$arch-apple-macosx15.0" --scratch-path ".build/$arch"
 done
 rm -rf "$out"
 mkdir -p "$out"

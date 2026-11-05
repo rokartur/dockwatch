@@ -2,6 +2,7 @@ import Foundation
 
 struct DockerError: LocalizedError {
     let message: String
+    var status = 0
     var errorDescription: String? { message }
 }
 
@@ -52,10 +53,10 @@ final class HTTPConnection {
         shutdown(fd, SHUT_RDWR)
     }
 
-    func send(_ method: String, _ path: String, body: Data?) throws {
+    func send(_ method: String, _ path: String, body: Data?, contentType: String = "application/json") throws {
         var head = "\(method) \(path) HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n"
         if let body {
-            head += "Content-Type: application/json\r\nContent-Length: \(body.count)\r\n"
+            head += "Content-Type: \(contentType)\r\nContent-Length: \(body.count)\r\n"
         } else if method != "GET" {
             head += "Content-Length: 0\r\n"
         }
