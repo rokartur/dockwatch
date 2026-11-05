@@ -12,8 +12,8 @@ version=${3:-0.0.0}
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 cp "$binary" "$app/Contents/MacOS/Dockwatch"
-# Assets.car carries the Liquid Glass, dark and tinted icon for macOS 26+; Dockwatch.icns is the macOS 14/15 fallback.
+# Assets.car carries the Liquid Glass, dark and tinted icon for macOS 26+; Dockwatch.icns is the macOS 15 fallback.
 xcrun actool packaging/Dockwatch.icon --compile "$app/Contents/Resources" --app-icon Dockwatch \
-    --platform macosx --minimum-deployment-target 14.0 \
+    --platform macosx --minimum-deployment-target 15.0 \
     --output-partial-info-plist "$(mktemp -d)/partial.plist" --errors >/dev/null
 sed "s/__VERSION__/$version/g" packaging/Info.plist >"$app/Contents/Info.plist"
