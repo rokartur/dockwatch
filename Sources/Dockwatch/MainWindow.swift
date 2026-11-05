@@ -4,13 +4,12 @@ enum Section: Int, CaseIterable {
     case containers, images, networks
 
     var title: String { ["Containers", "Images", "Networks"][rawValue] }
-    var symbol: String { ["shippingbox", "square.stack.3d.up", "network"][rawValue] }
 }
 
 enum Pane: Int, CaseIterable {
-    case logs, stats, inspect, env
+    case logs, stats, files, inspect, env
 
-    var title: String { ["Logs", "Stats", "Inspect", "Env"][rawValue] }
+    var title: String { ["Logs", "Stats", "Files", "Inspect", "Env"][rawValue] }
 }
 
 private extension NSToolbarItem.Identifier {
@@ -19,10 +18,13 @@ private extension NSToolbarItem.Identifier {
     static let stop = Self("stop")
     static let restart = Self("restart")
     static let remove = Self("remove")
+    static let terminal = Self("terminal")
     static let pull = Self("pull")
     static let prune = Self("prune")
     static let panes = Self("panes")
     static let runningFilter = Self("runningFilter")
+    static let unusedFilter = Self("unusedFilter")
+    static let actionSpacer = Self("actionSpacer")
     static let search = Self("search")
     static let logFilter = Self("logFilter")
 }
@@ -37,6 +39,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
     private(set) var snapshot = Snapshot()
     private(set) var section = Section.containers
     private(set) var onlyRunning = false
+    private(set) var onlyUnused = false
     private(set) var search = ""
     /// Item whose detail replaces the list: a container ID, image reference or network ID.
     private(set) var openID: String?
@@ -46,7 +49,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
     private var rescanTimer: Timer?
     private var keyMonitor: Any?
 
-    private let sidebar = SidebarController()
+    let sidebar = SidebarController()
     private let list = ListController()
     private let detail = DetailController()
     private let content = NSTabViewController()
@@ -75,6 +78,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebar)
         sidebarItem.minimumThickness = 200
         sidebarItem.maximumThickness = 300
+        sidebarItem.canCollapse = false
         split.addSplitViewItem(sidebarItem)
         let contentItem = NSSplitViewItem(viewController: content)
         if #available(macOS 26, *) {
@@ -285,6 +289,11 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         list.reload()
     }
 
+    @objc private func unusedFilterChanged(_ sender: NSToolbarItemGroup) {
+        onlyUnused = sender.selectedIndex == 1
+        list.reload()
+    }
+
     @objc func toggleOnlyRunning(_ sender: Any?) {
         guard section == .containers, openID == nil else { return }
         onlyRunning.toggle()
@@ -323,6 +332,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
             ("Go to Networks", #selector(showNetworks)),
             ("Start or Stop Container", #selector(toggleStart)),
             ("Restart Container", #selector(restartContainer)),
+            ("Open in Terminal", #selector(openInTerminal)),
             ("Remove Selected", #selector(removeSelected)),
             ("Search or Filter Logs", #selector(focusSearch)),
             ("Show Only Running Containers", #selector(toggleOnlyRunning)),
@@ -356,6 +366,15 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
     @objc func toggleStart(_ sender: Any?) {
         guard let container = targetContainer else { return }
         container.running ? stopContainer(sender) : startContainer(sender)
+    }
+
+    @objc func openInTerminal(_ sender: Any?) {
+        guard let docker, let container = targetContainer else { return }
+        do {
+            try openTerminal(socket: docker.socket, containerID: container.id)
+        } catch {
+            showError(error)
+        }
     }
 
     @objc func startContainer(_ sender: Any?) { runOnTarget { try await $0.start($1) } }
@@ -505,7 +524,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
     private func canPerform(_ action: Selector?) -> Bool {
         switch action {
         case #selector(startContainer): targetContainer.map { !$0.running } ?? false
-        case #selector(stopContainer): targetContainer?.running ?? false
+        case #selector(stopContainer), #selector(openInTerminal): targetContainer?.running ?? false
         case #selector(restartContainer), #selector(toggleStart): targetContainer != nil
         case #selector(removeSelected): canRemoveTarget
         case #selector(pullImage): docker != nil && pulling == nil
@@ -530,7 +549,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
 
     // MARK: Keys
 
-    /// Single-letter shortcuts apply unless a text field is being edited, so they work with the
+    /// Esc and Return apply unless a text field is being edited, so they work with the
     /// list, the sidebar or a read-only log in focus.
     private func handleKey(_ event: NSEvent) -> Bool {
         guard let window, event.window === window, window.attachedSheet == nil else { return false }
@@ -548,8 +567,13 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
             guard openID != nil else { return false }
             closeDetail()
         case (36, _), (76, _):
-            guard openID == nil, let id = list.selectedID else { return false }
+            guard openID == nil else { return false }
+            if list.handleGroupKey(event.keyCode) { return true }
+            guard let id = list.selectedID else { return false }
             open(id)
+        case (123, _), (124, _):
+            guard openID == nil, window.firstResponder === list.tableView else { return false }
+            return list.handleGroupKey(event.keyCode)
         default:
             return false
         }
@@ -604,52 +628,55 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         window.subtitle = subtitle.filter { !$0.isEmpty }.joined(separator: " · ")
     }
 
+    /// Actions sit at the trailing edge in every mode, so switching modes never moves them.
     private var toolbarIdentifiers: [NSToolbarItem.Identifier] {
         var identifiers: [NSToolbarItem.Identifier] = [.sidebarTrackingSeparator]
         if openID != nil {
-            identifiers.append(.back)
+            identifiers += [.back, .flexibleSpace]
             if section == .containers {
-                identifiers += [.flexibleSpace, .panes, .flexibleSpace, .start, .stop, .restart, .remove]
-                return detail.pane == .logs ? identifiers + [.logFilter] : identifiers
+                identifiers += [.panes, .flexibleSpace]
+                if detail.pane == .logs { identifiers.append(.logFilter) }
+                return identifiers + [.terminal, .start, .stop, .restart, .remove]
             }
-            return identifiers + [.flexibleSpace, .remove]
+            return identifiers + [.remove]
         }
         identifiers.append(.flexibleSpace)
         switch section {
-        case .containers: identifiers += [.start, .stop, .restart, .remove, .runningFilter]
-        case .images: identifiers += [.pull, .remove, .prune]
-        case .networks: identifiers += [.remove, .prune]
+        case .containers: return identifiers + [.runningFilter, .search, .terminal, .start, .stop, .restart, .remove]
+        // Every section has a filter in the same slot, so NSToolbar morphs one into the other; it does not
+        // animate items that only move, so a slot left empty would make Search jump.
+        case .images: return identifiers + [.unusedFilter, .search, .actionSpacer, .pull, .remove, .prune]
+        case .networks: return identifiers + [.unusedFilter, .search, .remove, .prune]
         }
-        return identifiers + [.search]
     }
 
-    /// NSToolbar has no per-item hiding before macOS 15, so a mode change swaps the items after
-    /// the part both modes share.
+    /// Every mode's items in one order; a mode change hides the unused ones, which NSToolbar animates.
+    private let allToolbarIdentifiers: [NSToolbarItem.Identifier] = [
+        .sidebarTrackingSeparator, .back, .flexibleSpace, .panes, .flexibleSpace, .runningFilter, .unusedFilter, .search, .logFilter, .actionSpacer,
+        .terminal, .start, .stop, .restart, .pull, .remove, .prune,
+    ]
+
     private func updateToolbar() {
         guard let toolbar = window?.toolbar else { return }
-        let wanted = toolbarIdentifiers
-        let current = toolbar.items.map(\.itemIdentifier)
-        var kept = 0
-        while kept < min(current.count, wanted.count), current[kept] == wanted[kept] {
-            kept += 1
-        }
-        while toolbar.items.count > kept {
-            toolbar.removeItem(at: toolbar.items.count - 1)
-        }
-        for index in kept..<wanted.count {
-            toolbar.insertItem(withItemIdentifier: wanted[index], at: index)
+        let wanted = Set(toolbarIdentifiers)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.25
+            context.allowsImplicitAnimation = true
+            for item in toolbar.items {
+                item.isHidden = !wanted.contains(item.itemIdentifier)
+            }
         }
         (toolbarItems[.panes] as? NSToolbarItemGroup)?.selectedIndex = detail.pane.rawValue
         (toolbarItems[.runningFilter] as? NSToolbarItemGroup)?.selectedIndex = onlyRunning ? 1 : 0
+        (toolbarItems[.unusedFilter] as? NSToolbarItemGroup)?.selectedIndex = onlyUnused ? 1 : 0
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        toolbarIdentifiers
+        allToolbarIdentifiers
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [.sidebarTrackingSeparator, .flexibleSpace, .back, .start, .stop, .restart, .remove, .pull, .prune,
-         .panes, .runningFilter, .search, .logFilter]
+        allToolbarIdentifiers
     }
 
     func toolbar(
@@ -662,6 +689,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         case .back:
             item = button(identifier, "Back", "chevron.left", #selector(goBack), key: "esc")
             item.isNavigational = true
+        case .terminal: item = button(identifier, "Open in Terminal", "apple.terminal", #selector(openInTerminal), key: "⌘T")
         case .start: item = button(identifier, "Start", "play.fill", #selector(startContainer), key: nil)
         case .stop: item = button(identifier, "Stop", "stop.fill", #selector(stopContainer), key: nil)
         case .restart: item = button(identifier, "Restart", "arrow.clockwise", #selector(restartContainer), key: nil)
@@ -680,6 +708,12 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
                 labels: ["All", "Running"], target: self, action: #selector(runningFilterChanged)
             )
             item.toolTip = "Show only running containers"
+        case .unusedFilter:
+            item = NSToolbarItemGroup(
+                itemIdentifier: identifier, titles: ["All", "Unused"], selectionMode: .selectOne,
+                labels: ["All", "Unused"], target: self, action: #selector(unusedFilterChanged)
+            )
+            item.toolTip = "Show only what no container uses"
         case .search, .logFilter:
             let search = NSSearchToolbarItem(itemIdentifier: identifier)
             let isLogFilter = identifier == .logFilter
@@ -688,6 +722,13 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
             search.searchField.target = self
             search.searchField.action = isLogFilter ? #selector(logFilterChanged) : #selector(searchChanged)
             item = search
+        case .actionSpacer:
+            item = NSToolbarItem(itemIdentifier: identifier)
+            let view = NSView()
+            view.widthAnchor.constraint(equalToConstant: 72).isActive = true
+            view.heightAnchor.constraint(equalToConstant: 20).isActive = true
+            item.view = view
+            item.isBordered = false
         default:
             return nil
         }

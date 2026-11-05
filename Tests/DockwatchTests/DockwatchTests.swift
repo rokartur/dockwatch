@@ -103,21 +103,77 @@ private func container(_ name: String, project: String?, running: Bool = true) -
     Container(id: name, name: name, image: "img", imageID: "i", ports: "", networks: [], status: "", running: running, project: project)
 }
 
-@Test func containersGroupByComposeProjectWithOtherLast() {
-    let rows = groupedByProject([
-        container("solo", project: nil),
-        container("web", project: "shop"),
-        container("db", project: "shop", running: false),
-        container("api", project: "blog"),
-    ])
-    #expect(rows.map { $0.id ?? "header" } == ["header", "api", "header", "db", "web", "header", "solo"])
-    #expect(rows[2] == .group(name: "shop", running: 1, total: 2))
-    #expect(rows[5] == .group(name: "Other", running: 1, total: 1))
+@Test func containersGroupByComposeProjectWithLooseOnesLast() {
+    let db = container("db", project: "shop", running: false)
+    let web = container("web", project: "shop")
+    let rows = groupedByProject([container("solo", project: nil), web, db, container("api", project: "blog")])
+    #expect(rows.map { $0.id ?? "header" } == ["header", "api", "header", "db", "web", "solo"])
+    #expect(rows[2] == .group(project: "shop", members: [db, web], collapsed: false))
+}
+
+@Test func collapsedProjectKeepsItsHeaderAndMembers() {
+    let web = container("web", project: "shop")
+    let rows = groupedByProject([web, container("api", project: "blog")], collapsed: ["shop"])
+    #expect(rows.map { $0.id ?? "header" } == ["header", "api", "header"])
+    #expect(rows[2] == .group(project: "shop", members: [web], collapsed: true))
 }
 
 @Test func noHeadersWithoutComposeProjects() {
     let rows = groupedByProject([container("b", project: nil), container("a", project: nil)])
     #expect(rows.map { $0.id ?? "header" } == ["a", "b"])
+}
+
+@Test func imagesSplitIntoInUseAndUnusedBySizeCountingSharedBytesOnce() {
+    func image(_ reference: String, id: String, size: Int64) -> Image {
+        Image(reference: reference, id: id, name: reference, tag: "", created: .now, size: size)
+    }
+    var web = container("web", project: nil)
+    web.imageID = "a"
+    let big = image("big", id: "b", size: 3_000_000)
+    let tagged = image("app:v1", id: "a", size: 1_000_000)
+    let alias = image("app:latest", id: "a", size: 1_000_000)
+    let rows = listRows(Snapshot(containers: [web], images: [big, tagged, alias]), section: .images, onlyRunning: false, search: "")
+    #expect(rows == [
+        .header(title: "In use", detail: "2 images · \(formatBytes(1_000_000))"),
+        .image(alias, usedBy: ["web"]),
+        .image(tagged, usedBy: ["web"]),
+        .header(title: "Unused", detail: "1 image · \(formatBytes(3_000_000))"),
+        .image(big, usedBy: []),
+    ])
+}
+
+@Test func sidebarSummariesCountRunningImagesInUseAndAttachedNetworks() {
+    var web = container("web", project: nil)
+    web.imageID = "a"
+    web.networks = ["app"]
+    let snapshot = Snapshot(
+        containers: [web, container("db", project: nil, running: false)],
+        images: [
+            Image(reference: "app:v1", id: "a", name: "app", tag: "v1", created: .now, size: 1_000_000),
+            Image(reference: "app:latest", id: "a", name: "app", tag: "latest", created: .now, size: 1_000_000),
+            Image(reference: "big", id: "b", name: "big", tag: "", created: .now, size: 3_000_000),
+        ],
+        networks: [Network(id: "1", name: "app", driver: "bridge", scope: "local"), Network(id: "2", name: "host", driver: "host", scope: "local")]
+    )
+    #expect(sectionSummary(snapshot, .containers) == "1 running · 1 stopped")
+    #expect(sectionSummary(snapshot, .images) == "\(formatBytes(4_000_000)) · 2 in use")
+    #expect(sectionSummary(snapshot, .networks) == "1 in use")
+}
+
+@Test func networksWithoutAttachedContainersGoUnderUnused() {
+    var web = container("web", project: nil)
+    web.networks = ["app"]
+    let app = Network(id: "1", name: "app", driver: "bridge", scope: "local")
+    let host = Network(id: "2", name: "host", driver: "host", scope: "local")
+    let rows = listRows(Snapshot(containers: [web], networks: [host, app]), section: .networks, onlyRunning: false, search: "")
+    #expect(rows == [
+        .header(title: "In use", detail: "1 network"),
+        .network(app, attached: ["web"]),
+        .header(title: "Unused", detail: "1 network"),
+        .network(host, attached: []),
+    ])
+    let unused = listRows(Snapshot(containers: [web], networks: [host, app]), section: .networks, onlyRunning: false, search: "", onlyUnused: true)
+    #expect(unused == [.header(title: "Unused", detail: "1 network"), .network(host, attached: [])])
 }
 
 @Test func statsMatchDockerStatsFormulas() throws {
@@ -160,4 +216,68 @@ private func container(_ name: String, project: String?, running: Bool = true) -
     #expect(color(of: "2\"") == .systemOrange)
     #expect(color(of: "-1.5") == .systemPurple)
     #expect(color(of: "null") == .systemPink)
+}
+
+@Test func listingPutsFoldersFirstAndSkipsBadLines() {
+    let text = "regular file\t174\t1700000000\t-rw-r--r--\t/etc/hosts\n"
+        + "directory\t4096\t1700000000\tdrwxr-xr-x\t/etc/apk\n"
+        + "stat: can't stat '/etc/broken': No such file\n"
+        + "regular empty file\t0\t1700000000\t-rw-r--r--\t/etc/a b\tc\n"
+    let entries = parseListing(text)
+    #expect(entries.map(\.name) == ["apk", "a b\tc", "hosts"])
+    #expect(entries[0].isFolder && !entries[2].isFolder)
+    #expect(entries[2].size == 174 && entries[2].mode == "-rw-r--r--")
+}
+
+@Test func demultiplexSplitsStdoutAndStderr() {
+    func frame(_ stream: UInt8, _ text: String) -> [UInt8] {
+        let payload = Array(text.utf8)
+        return [stream, 0, 0, 0, 0, 0, 0, UInt8(payload.count)] + payload
+    }
+    let result = demultiplex(Data(frame(1, "out1 ") + frame(2, "err") + frame(1, "out2")))
+    #expect(String(decoding: result.output, as: UTF8.self) == "out1 out2")
+    #expect(String(decoding: result.errors, as: UTF8.self) == "err")
+}
+
+@Test func firstFileInTarSkipsLongNameHeaders() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("dwtar-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let name = String(repeating: "n", count: 150) + "-zażółć.txt"
+    try Data("hello\n".utf8).write(to: folder.appendingPathComponent(name))
+    let tar = folder.appendingPathComponent("out.tar")
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+    process.arguments = ["-cf", tar.path, "--format", "pax", "--no-mac-metadata", "-C", folder.path, name]
+    try process.run()
+    process.waitUntilExit()
+    #expect(firstFileInTar(try Data(contentsOf: tar)) == Data("hello\n".utf8))
+    #expect(firstFileInTar(Data(count: 1024)) == nil)
+}
+
+@Test func uploadArchiveDropsMacExtendedAttributes() throws {
+    let folder = FileManager.default.temporaryDirectory.appendingPathComponent("dwup-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let file = folder.appendingPathComponent("note.txt")
+    try Data("hi\n".utf8).write(to: file)
+    #expect(setxattr(file.path, "com.example.tag", "x", 1, 0, 0) == 0)
+    let archive = folder.appendingPathComponent("out.tar")
+    try makeUploadArchive(of: file, at: archive)
+    let tar = try Data(contentsOf: archive)
+    #expect(tar.range(of: Data("com.example.tag".utf8)) == nil)
+    #expect(firstFileInTar(tar) == Data("hi\n".utf8))
+}
+
+@Test func parentFolderStopsAtRoot() {
+    #expect(parentFolder("/etc/apk") == "/etc")
+    #expect(parentFolder("/etc") == "/")
+    #expect(parentFolder("/") == "/")
+}
+
+@Test func terminalScriptQuotesSocketAndID() {
+    let script = terminalScript(socket: "/Users/o'neil/.lighter/docker.sock", containerID: "abc123")
+    #expect(script.contains(#"export DOCKER_HOST='unix:///Users/o'\''neil/.lighter/docker.sock'"#))
+    #expect(script.contains("exec docker exec -it 'abc123' sh -c"))
+    #expect(script.hasPrefix("#!/bin/sh\nrm -f \"$0\"\n"))
 }

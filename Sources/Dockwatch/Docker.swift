@@ -27,6 +27,7 @@ struct Network: Equatable {
     var name: String
     var driver: String
     var scope: String
+    var subnet = ""
 
     /// Docker creates these itself and refuses to remove them.
     var isSystem: Bool { ["bridge", "host", "none"].contains(name) }
@@ -42,6 +43,8 @@ struct Engine {
     var version: String
     var cpus: Int
     var memory: Int64
+    var system: String
+    var architecture: String
 }
 
 /// Docker Engine API client over a Unix socket. Paths carry no API version, so the daemon
@@ -60,15 +63,22 @@ final class Docker {
         return Snapshot(
             containers: try await containers.map(Container.init),
             images: try await images.flatMap(imagesFromSummary),
+            // The daemon lists networks in map order, which changes per call and would fail the Snapshot comparison.
             networks: try await networks.map {
-                Network(id: $0.Id, name: $0.Name, driver: $0.Driver, scope: $0.Scope)
-            }
+                Network(
+                    id: $0.Id, name: $0.Name, driver: $0.Driver, scope: $0.Scope,
+                    subnet: $0.IPAM?.Config?.first?.Subnet ?? ""
+                )
+            }.sorted { $0.id < $1.id }
         )
     }
 
     func engine() async throws -> Engine {
         let info = try await get("/info", as: Info.self)
-        return Engine(version: info.ServerVersion, cpus: info.NCPU, memory: info.MemTotal)
+        return Engine(
+            version: info.ServerVersion, cpus: info.NCPU, memory: info.MemTotal,
+            system: info.OperatingSystem, architecture: info.Architecture
+        )
     }
 
     func ping() async -> Bool {
@@ -147,6 +157,58 @@ final class Docker {
         try stream("/containers/\(id)/stats?stream=1", onData: onData, onEnd: onEnd)
     }
 
+    /// One reading with `precpu_stats` filled, so CPU needs no second call; the daemon takes about 1 s.
+    func statsOnce(_ id: String) async throws -> Sample {
+        Sample(try await get("/containers/\(id)/stats?stream=false", as: StatsResponse.self))
+    }
+
+    /// Runs `command` without a TTY and waits for it to exit. No shell: arguments pass as they are.
+    func exec(_ id: String, _ command: [String]) async throws -> (output: Data, errors: Data) {
+        let create = try JSONSerialization.data(withJSONObject: ["AttachStdout": true, "AttachStderr": true, "Cmd": command])
+        struct Created: Decodable { let Id: String }
+        let exec = try JSONDecoder().decode(Created.self, from: try await request("POST", "/containers/\(id)/exec", body: create))
+        let start = try JSONSerialization.data(withJSONObject: ["Detach": false, "Tty": false])
+        return demultiplex(try await request("POST", "/exec/\(exec.Id)/start", body: start))
+    }
+
+    /// Entries of one folder in a running container, through `find` and `stat` in the image.
+    func listFiles(_ id: String, in folder: String) async throws -> [FileEntry] {
+        let output: Data, errors: Data
+        do {
+            (output, errors) = try await exec(id, [
+                "find", folder, "-mindepth", "1", "-maxdepth", "1",
+                "-exec", "stat", "-L", "-c", "%F\t%s\t%Y\t%A\t%n", "{}", "+",
+            ])
+        } catch let error as DockerError where error.status == 409 {
+            throw DockerError(message: "Start the container to browse its files.", status: 409)
+        }
+        // Broken links make stat fail for one entry while the rest still list, so stderr counts only alone.
+        if output.isEmpty, !errors.isEmpty {
+            throw DockerError(message: String(decoding: errors, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return parseListing(String(decoding: output, as: UTF8.self))
+    }
+
+    /// A file or folder as Docker sends it: a tar archive. Works on stopped containers too.
+    func archive(_ id: String, path: String) async throws -> Data {
+        try await request("GET", "/containers/\(id)/archive?path=\(escape(path))")
+    }
+
+    /// Streams the archive into `file`, so a large download never sits in memory.
+    func downloadArchive(_ id: String, path: String, to file: URL) async throws {
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try await request("GET", "/containers/\(id)/archive?path=\(escape(path))", body: nil, contentType: "", timeout: 120) {
+            try handle.write(contentsOf: $0)
+        }
+    }
+
+    /// Extracts a tar archive into `folder` inside the container.
+    func uploadArchive(_ id: String, tar: Data, into folder: String) async throws {
+        try await request("PUT", "/containers/\(id)/archive?path=\(escape(folder))", body: tar, contentType: "application/x-tar")
+    }
+
     private func stream(
         _ path: String, onData: @escaping (Data, String) -> Void, onEnd: @escaping (Error?) -> Void
     ) throws -> DockerStream {
@@ -165,20 +227,33 @@ final class Docker {
 
     /// Stop waits up to 10 s before SIGKILL until the daemon answers, so the default timeout must exceed it.
     @discardableResult
-    private func request(_ method: String, _ path: String, timeout: TimeInterval = 120) async throws -> Data {
+    private func request(
+        _ method: String, _ path: String, body: Data? = nil, contentType: String = "application/json",
+        timeout: TimeInterval = 120
+    ) async throws -> Data {
+        var response = Data()
+        try await request(method, path, body: body, contentType: contentType, timeout: timeout) { response.append($0) }
+        return response
+    }
+
+    /// Hands the response body to `onChunk` on a background thread as it arrives.
+    private func request(
+        _ method: String, _ path: String, body: Data?, contentType: String, timeout: TimeInterval,
+        onChunk: @escaping (Data) throws -> Void
+    ) async throws {
         let socket = socket
-        return try await withCheckedThrowingContinuation { continuation in
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             DispatchQueue.global().async {
                 continuation.resume(with: Result {
                     let connection = try HTTPConnection(socket: socket, timeout: timeout)
-                    try connection.send(method, path, body: nil)
+                    try connection.send(method, path, body: body, contentType: contentType)
                     try connection.readHead()
-                    var body = Data()
-                    try connection.readBody { body.append($0) }
                     guard connection.status < 400 else {
-                        throw Docker.error(status: connection.status, body: body)
+                        var error = Data()
+                        try connection.readBody { error.append($0) }
+                        throw Docker.error(status: connection.status, body: error)
                     }
-                    return body
+                    try connection.readBody(onChunk)
                 })
             }
         }
@@ -187,7 +262,7 @@ final class Docker {
     static func error(status: Int, body: Data) -> DockerError {
         struct Message: Decodable { let message: String }
         let message = try? JSONDecoder().decode(Message.self, from: body).message
-        return DockerError(message: message ?? "Docker answered HTTP \(status)")
+        return DockerError(message: message ?? "Docker answered HTTP \(status)", status: status)
     }
 
     private func escape(_ value: String) -> String {
@@ -287,10 +362,18 @@ private struct NetworkSummary: Decodable {
     var Name: String
     var Driver: String
     var Scope: String
+    var IPAM: IPAMSummary?
+
+    struct IPAMSummary: Decodable {
+        var Config: [Pool]?
+        struct Pool: Decodable { var Subnet: String? }
+    }
 }
 
 private struct Info: Decodable {
     var ServerVersion: String
     var NCPU: Int
     var MemTotal: Int64
+    var OperatingSystem: String
+    var Architecture: String
 }

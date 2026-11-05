@@ -1,7 +1,9 @@
 import AppKit
+import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var windowController: MainWindowController?
+    private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.mainMenu = makeMainMenu()
@@ -9,6 +11,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowController.showWindow(nil)
         self.windowController = windowController
         NSApp.activate()
+    }
+
+    @objc func showSettings(_ sender: Any?) {
+        let window = settingsWindow ?? NSWindow(contentViewController: NSHostingController(rootView: SettingsView()))
+        window.title = "Settings"
+        window.styleMask.remove([.resizable, .miniaturizable])
+        window.isReleasedWhenClosed = false
+        settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -37,6 +48,8 @@ private func makeMainMenu() -> NSMenu {
     _ = submenu("Dockwatch", [
         item("About Dockwatch", #selector(NSApplication.orderFrontStandardAboutPanel(_:))),
         .separator(),
+        item("Settings…", #selector(AppDelegate.showSettings(_:)), ","),
+        .separator(),
         item("Hide Dockwatch", #selector(NSApplication.hide(_:)), "h"),
         item("Hide Others", #selector(NSApplication.hideOtherApplications(_:)), "h", [.command, .option]),
         item("Show All", #selector(NSApplication.unhideAllApplications(_:))),
@@ -61,6 +74,10 @@ private func makeMainMenu() -> NSMenu {
         .separator(),
         item("Command Palette", #selector(MainWindowController.showPalette(_:)), "k"),
         item("Rescan Runtimes", #selector(MainWindowController.rescan(_:)), "r"),
+        item("Open in Terminal", #selector(MainWindowController.openInTerminal(_:)), "t"),
+        .separator(),
+        item("Open Folder", #selector(FilesController.openSelected(_:)), String(UnicodeScalar(NSDownArrowFunctionKey)!)),
+        item("Enclosing Folder", #selector(FilesController.openEnclosingFolder(_:)), String(UnicodeScalar(NSUpArrowFunctionKey)!)),
         .separator(),
         item("Enter Full Screen", #selector(NSWindow.toggleFullScreen(_:)), "f", [.command, .control]),
     ])

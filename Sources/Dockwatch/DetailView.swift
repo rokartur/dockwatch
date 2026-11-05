@@ -1,9 +1,11 @@
 import AppKit
 import SwiftUI
 
-/// Logs, Stats, Inspect and Env of one container, or Inspect alone for an image or network.
+/// Logs, Stats, Files, Inspect and Env of one container, or Inspect alone for an image or network.
 final class DetailController: NSViewController, NSTableViewDataSource, NSTableViewDelegate {
-    weak var main: MainWindowController?
+    weak var main: MainWindowController? {
+        didSet { files.main = main }
+    }
     private(set) var pane = Pane.logs
     private var docker: Docker?
     private var openID: String?
@@ -23,19 +25,24 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
     private let logScroll = NSTextView.scrollableTextView()
     private let inspectScroll = NSTextView.scrollableTextView()
     private lazy var statsView = NSHostingView(rootView: StatsView(samples: []))
+    private let files = FilesController()
     private let envScroll = NSScrollView()
     private let envTable = NSTableView()
     private let monospaced = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
 
     private var logText: NSTextView { logScroll.documentView as! NSTextView }
     private var inspectText: NSTextView { inspectScroll.documentView as! NSTextView }
-    private var paneViews: [NSView] { [logScroll, statsView, inspectScroll, envScroll] }
+    private var paneViews: [NSView] { [logScroll, statsView, files.view, inspectScroll, envScroll] }
 
     /// Gets focus on open, so Cmd+F and Cmd+A act on the text.
-    var focusView: NSView { pane == .inspect || containerID == nil ? inspectText : logText }
+    var focusView: NSView {
+        if containerID == nil || pane == .inspect { return inspectText }
+        return pane == .files ? files.table : logText
+    }
 
     override func loadView() {
         let container = NSView()
+        addChild(files)
         for text in [logText, inspectText] {
             text.isEditable = false
             text.isRichText = false
@@ -68,7 +75,7 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
             pane.translatesAutoresizingMaskIntoConstraints = false
             container.addSubview(pane)
             // Text panes stop at the toolbar: lines scrolling under the window title are unreadable.
-            let isTextPane = pane === logScroll || pane === inspectScroll
+            let isTextPane = pane === logScroll || pane === inspectScroll || pane === files.view
             let top = isTextPane ? container.safeAreaLayoutGuide.topAnchor : container.topAnchor
             NSLayoutConstraint.activate([
                 pane.topAnchor.constraint(equalTo: top),
@@ -89,6 +96,7 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
         loadInspect(section, id)
         if section == .containers {
             containerID = id
+            files.open(docker: docker, containerID: id)
             startStreams()
             show(pane)
         } else {
@@ -104,6 +112,7 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
         docker = nil
         openID = nil
         containerID = nil
+        files.close()
         filter = ""
         resetLogs()
         history.clear()
@@ -127,6 +136,10 @@ final class DetailController: NSViewController, NSTableViewDataSource, NSTableVi
         pane = newPane
         setVisiblePane(newPane)
         renderStatsIfVisible()
+        if newPane == .files {
+            files.reload()
+            view.window?.makeFirstResponder(files.table)
+        }
     }
 
     /// A hidden NSHostingView still lays out its charts, so samples render only while Stats shows.
