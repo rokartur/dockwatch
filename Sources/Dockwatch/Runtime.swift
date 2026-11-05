@@ -38,6 +38,13 @@ func discoverRuntimes() async -> [Runtime] {
     return runtimes
 }
 
+/// The preferred socket when it runs, else the current Docker context, else the first running runtime.
+func launchRuntime(_ runtimes: [Runtime], preferred: String?) -> Runtime? {
+    runtimes.first { $0.socket == preferred && $0.running }
+        ?? runtimes.first { $0.current && $0.running }
+        ?? runtimes.first { $0.running }
+}
+
 /// Context name and endpoint host from `~/.docker/contexts/meta/*/meta.json`, plus `currentContext`.
 private func readContexts(home: String) -> (contexts: [(name: String, host: String)], current: String?) {
     let dockerDir = URL(fileURLWithPath: home).appendingPathComponent(".docker")

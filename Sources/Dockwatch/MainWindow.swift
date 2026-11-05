@@ -33,17 +33,25 @@ private extension NSToolbarItem.Identifier {
 /// The sidebar, list and detail controllers read it and call back into it.
 final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolbarItemValidation, NSMenuItemValidation {
     private(set) var runtimes: [Runtime] = []
-    private(set) var chosenSocket: String?
+    private(set) var chosenSocket: String? {
+        // Launch with nothing running leaves it nil; keep the saved runtime for the next launch.
+        didSet { if let chosenSocket { UserDefaults.standard.set(chosenSocket, forKey: "lastRuntime") } }
+    }
     private(set) var docker: Docker?
     private(set) var engine: Engine?
     private(set) var snapshot = Snapshot()
     private(set) var section = Section.containers
-    private(set) var onlyRunning = false
-    private(set) var onlyUnused = false
+    private(set) var onlyRunning = UserDefaults.standard.bool(forKey: "onlyRunning") {
+        didSet { UserDefaults.standard.set(onlyRunning, forKey: "onlyRunning") }
+    }
+    private(set) var onlyUnused = UserDefaults.standard.bool(forKey: "onlyUnused") {
+        didSet { UserDefaults.standard.set(onlyUnused, forKey: "onlyUnused") }
+    }
     private(set) var search = ""
     /// Item whose detail replaces the list: a container ID, image reference or network ID.
     private(set) var openID: String?
     private var pulling: String?
+    private let terminalMenu = TerminalMenu()
     private var events: DockerStream?
     private var refreshPending = false
     private var rescanTimer: Timer?
@@ -123,15 +131,15 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         scheduleRefresh()
     }
 
-    /// Keeps the chosen runtime by socket. With no choice yet, picks the current Docker context
-    /// or the first running runtime. Connects once the chosen one runs, disconnects when it stops.
+    /// Keeps the chosen runtime by socket. With no choice yet, picks one with `launchRuntime`.
+    /// Connects once the chosen one runs, disconnects when it stops.
     private func applyRuntimes(_ found: [Runtime]) {
         if found != runtimes {
             runtimes = found
             sidebar.reload()
         }
         if chosenSocket == nil {
-            chosenSocket = (found.first { $0.current && $0.running } ?? found.first { $0.running })?.socket
+            chosenSocket = launchRuntime(found, preferred: UserDefaults.standard.string(forKey: "lastRuntime"))?.socket
         }
         let running = found.first { $0.socket == chosenSocket }?.running ?? false
         if running, docker == nil, let chosenSocket {
@@ -363,9 +371,19 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         return snapshot.containers.first { $0.id == openID }
     }
 
+    /// Every container of the selected compose project, or the one target container.
+    private var targetContainers: [Container] {
+        guard section == .containers else { return [] }
+        if openID == nil, let project = list.selectedProject {
+            return snapshot.containers.filter { $0.project == project }
+        }
+        return targetContainer.map { [$0] } ?? []
+    }
+
     @objc func toggleStart(_ sender: Any?) {
-        guard let container = targetContainer else { return }
-        container.running ? stopContainer(sender) : startContainer(sender)
+        let containers = targetContainers
+        guard !containers.isEmpty else { return }
+        containers.contains(where: \.running) ? stopContainer(sender) : startContainer(sender)
     }
 
     @objc func openInTerminal(_ sender: Any?) {
@@ -377,15 +395,49 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         }
     }
 
-    @objc func startContainer(_ sender: Any?) { runOnTarget { try await $0.start($1) } }
-    @objc func stopContainer(_ sender: Any?) { runOnTarget { try await $0.stop($1) } }
-    @objc func restartContainer(_ sender: Any?) { runOnTarget { try await $0.restart($1) } }
+    // Compose order: dependencies start first and stop last.
+    @objc func startContainer(_ sender: Any?) {
+        run(startBatches(targetContainers.filter { !$0.running })) { try await $0.start($1) }
+    }
+    @objc func stopContainer(_ sender: Any?) {
+        run(startBatches(targetContainers.filter(\.running)).reversed()) { try await $0.stop($1) }
+    }
+    @objc func restartContainer(_ sender: Any?) {
+        run(startBatches(targetContainers)) { try await $0.restart($1) }
+    }
 
-    private func runOnTarget(_ action: @escaping (Docker, String) async throws -> Void) {
-        guard let docker, let container = targetContainer else { return }
+    /// Batch by batch, each batch at once; the first failing batch shows its error and ends the run before `finish`.
+    private func run(
+        _ batches: [[Container]], _ action: @escaping (Docker, String) async throws -> Void,
+        finish: ((Docker) async throws -> Void)? = nil
+    ) {
+        guard let docker, !batches.isEmpty else { return }
         Task {
+            for batch in batches {
+                let errors = await withTaskGroup(of: Error?.self) { group in
+                    for container in batch {
+                        group.addTask {
+                            do {
+                                try await action(docker, container.id)
+                                return nil
+                            } catch {
+                                return error
+                            }
+                        }
+                    }
+                    var errors: [Error] = []
+                    for await case let error? in group {
+                        errors.append(error)
+                    }
+                    return errors
+                }
+                if let error = errors.first {
+                    showError(error)
+                    return
+                }
+            }
             do {
-                try await action(docker, container.id)
+                try await finish?(docker)
             } catch {
                 showError(error)
             }
@@ -393,18 +445,16 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
     }
 
     @objc func removeSelected(_ sender: Any?) {
+        if section == .containers {
+            removeContainers(targetContainers)
+            return
+        }
         guard let docker, let window, let id = targetID, canRemoveTarget else { return }
         let section = section
         let alert = NSAlert()
-        var force = false
         switch section {
         case .containers:
-            guard let container = targetContainer else { return }
-            force = container.running
-            alert.messageText = "Remove \(container.name)?"
-            alert.informativeText = container.running
-                ? "The container is running. It will be killed, then removed. Its volumes stay."
-                : "The container is removed. Its volumes stay."
+            return
         case .images:
             guard let image = snapshot.images.first(where: { $0.reference == id }) else { return }
             if snapshot.containers.contains(where: { $0.imageID == image.id }) {
@@ -418,16 +468,16 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
             alert.messageText = "Remove network \(network.name)?"
             alert.informativeText = "Docker refuses while a container is attached."
         }
-        alert.addButton(withTitle: force ? "Force Remove" : "Remove").hasDestructiveAction = true
+        alert.addButton(withTitle: "Remove").hasDestructiveAction = true
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: window) { response in
             guard response == .alertFirstButtonReturn else { return }
             Task {
                 do {
-                    switch section {
-                    case .containers: try await docker.removeContainer(id, force: force)
-                    case .images: try await docker.removeImage(id)
-                    case .networks: try await docker.removeNetwork(id)
+                    if section == .images {
+                        try await docker.removeImage(id)
+                    } else {
+                        try await docker.removeNetwork(id)
                     }
                 } catch {
                     self.showError(error)
@@ -436,10 +486,43 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         }
     }
 
+    /// One container, or every container of a compose project; running ones are killed first.
+    private func removeContainers(_ containers: [Container]) {
+        guard let window, let first = containers.first else { return }
+        let running = containers.filter(\.running).count
+        let alert = NSAlert()
+        let project = openID == nil ? list.selectedProject : nil
+        let networks = snapshot.networks.filter { $0.project != nil && $0.project == project }
+        if let project {
+            alert.messageText = "Remove compose project \(project)?"
+            alert.informativeText = "\(containers.count) containers"
+                + (networks.isEmpty ? "" : " and \(networks.count) networks")
+                + " are removed"
+                + (running > 0 ? ", \(running) running ones are killed first" : "")
+                + ". Volumes and images stay."
+        } else {
+            alert.messageText = "Remove \(first.name)?"
+            alert.informativeText = first.running
+                ? "The container is running. It will be killed, then removed. Its volumes stay."
+                : "The container is removed. Its volumes stay."
+        }
+        alert.addButton(withTitle: running > 0 ? "Force Remove" : "Remove").hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let runningIDs = Set(containers.filter(\.running).map(\.id))
+            self.run([containers], { try await $0.removeContainer($1, force: runningIDs.contains($1)) }) { docker in
+                for network in networks {
+                    try await docker.removeNetwork(network.id)
+                }
+            }
+        }
+    }
+
     private var canRemoveTarget: Bool {
-        guard let id = targetID else { return false }
+        let id = targetID
         switch section {
-        case .containers: return targetContainer != nil
+        case .containers: return !targetContainers.isEmpty
         case .images: return snapshot.images.contains { $0.reference == id }
         case .networks: return snapshot.networks.contains { $0.id == id && !$0.isSystem }
         }
@@ -523,9 +606,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
 
     private func canPerform(_ action: Selector?) -> Bool {
         switch action {
-        case #selector(startContainer): targetContainer.map { !$0.running } ?? false
-        case #selector(stopContainer), #selector(openInTerminal): targetContainer?.running ?? false
-        case #selector(restartContainer), #selector(toggleStart): targetContainer != nil
+        case #selector(startContainer): targetContainers.contains { !$0.running }
+        case #selector(stopContainer): targetContainers.contains(where: \.running)
+        case #selector(openInTerminal): targetContainer?.running ?? false
+        case #selector(restartContainer), #selector(toggleStart): !targetContainers.isEmpty
         case #selector(removeSelected): canRemoveTarget
         case #selector(pullImage): docker != nil && pulling == nil
         case #selector(pruneUnused), #selector(pruneImages), #selector(pruneNetworks): docker != nil
@@ -689,7 +773,15 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSToolb
         case .back:
             item = button(identifier, "Back", "chevron.left", #selector(goBack), key: "esc")
             item.isNavigational = true
-        case .terminal: item = button(identifier, "Open in Terminal", "apple.terminal", #selector(openInTerminal), key: "⌘T")
+        case .terminal:
+            let menuItem = NSMenuToolbarItem(itemIdentifier: identifier)
+            menuItem.menu = terminalMenu.menu
+            menuItem.label = "Open in Terminal"
+            menuItem.toolTip = "Open in Terminal (⌘T)"
+            menuItem.image = NSImage(systemSymbolName: "apple.terminal", accessibilityDescription: "Open in Terminal")
+            menuItem.target = self
+            menuItem.action = #selector(openInTerminal)
+            item = menuItem
         case .start: item = button(identifier, "Start", "play.fill", #selector(startContainer), key: nil)
         case .stop: item = button(identifier, "Stop", "stop.fill", #selector(stopContainer), key: nil)
         case .restart: item = button(identifier, "Restart", "arrow.clockwise", #selector(restartContainer), key: nil)

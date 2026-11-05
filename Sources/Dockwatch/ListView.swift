@@ -166,6 +166,11 @@ final class ListController: NSViewController, NSTableViewDataSource, NSTableView
         rows.indices.contains(tableView.selectedRow) ? rows[tableView.selectedRow].id : nil
     }
 
+    var selectedProject: String? {
+        guard rows.indices.contains(tableView.selectedRow), case let .group(project, _, _) = rows[tableView.selectedRow] else { return nil }
+        return project
+    }
+
     /// Compose group rows are selectable too, so the keyboard can fold them.
     private func selectionKey(_ row: ListRow) -> String? {
         if case let .group(project, _, _) = row { return "project:" + project }
@@ -283,8 +288,11 @@ final class ListController: NSViewController, NSTableViewDataSource, NSTableView
             cell.show(title, detail: detail)
             return cell
         case let .group(project, members, isCollapsed):
-            let cell = reusable("group") { GroupCell(toggleTarget: self, action: #selector(chevronClicked)) }
-            cell.show(project: project, members: members, collapsed: isCollapsed, latest: members.compactMap { live[$0.id] })
+            let cell = reusable("group") { GroupCell(toggleTarget: self, action: #selector(chevronClicked), actionTarget: main) }
+            cell.show(
+                project: project, members: members, collapsed: isCollapsed, latest: members.compactMap { live[$0.id] },
+                selected: selected
+            )
             return cell
         case let .container(container):
             let cell = reusable("container") { ContainerCell(actionTarget: main) }

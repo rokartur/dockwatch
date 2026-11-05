@@ -10,6 +10,9 @@ struct Container: Equatable {
     var status: String
     var running: Bool
     var project: String?
+    var service: String? = nil
+    /// Services this one waits for, from compose's `com.docker.compose.depends_on` label.
+    var dependsOn: [String] = []
 }
 
 struct Image: Equatable {
@@ -28,6 +31,7 @@ struct Network: Equatable {
     var driver: String
     var scope: String
     var subnet = ""
+    var project: String? = nil
 
     /// Docker creates these itself and refuses to remove them.
     var isSystem: Bool { ["bridge", "host", "none"].contains(name) }
@@ -67,7 +71,8 @@ final class Docker {
             networks: try await networks.map {
                 Network(
                     id: $0.Id, name: $0.Name, driver: $0.Driver, scope: $0.Scope,
-                    subnet: $0.IPAM?.Config?.first?.Subnet ?? ""
+                    subnet: $0.IPAM?.Config?.first?.Subnet ?? "",
+                    project: $0.Labels?["com.docker.compose.project"]
                 )
             }.sorted { $0.id < $1.id }
         )
@@ -323,9 +328,36 @@ extension Container {
             ports: publishedPorts(summary.Ports ?? []),
             networks: summary.NetworkSettings?.Networks.map { Array($0.keys) } ?? [],
             status: summary.Status,
-            running: summary.State == "running", project: summary.Labels?["com.docker.compose.project"]
+            running: summary.State == "running", project: summary.Labels?["com.docker.compose.project"],
+            service: summary.Labels?["com.docker.compose.service"],
+            // "db:service_started:false,redis:service_healthy:true"
+            dependsOn: (summary.Labels?["com.docker.compose.depends_on"] ?? "").split(separator: ",").compactMap {
+                $0.split(separator: ":").first.map(String.init)
+            }
         )
     }
+}
+
+/// Compose start order: a batch depends only on earlier batches, so each batch can run at once.
+/// A dependency outside `containers` counts as met; members of a cycle go last, together.
+func startBatches(_ containers: [Container]) -> [[Container]] {
+    let services = Set(containers.compactMap(\.service))
+    var left = containers
+    var started: Set<String> = []
+    var batches: [[Container]] = []
+    while !left.isEmpty {
+        let ready = left.filter { container in
+            container.dependsOn.allSatisfy { started.contains($0) || !services.contains($0) }
+        }
+        if ready.isEmpty {
+            batches.append(left)
+            break
+        }
+        batches.append(ready)
+        started.formUnion(ready.compactMap(\.service))
+        left.removeAll { container in ready.contains { $0.id == container.id } }
+    }
+    return batches
 }
 
 // Engine API shapes, named as Docker names its JSON fields.
@@ -363,6 +395,7 @@ private struct NetworkSummary: Decodable {
     var Driver: String
     var Scope: String
     var IPAM: IPAMSummary?
+    var Labels: [String: String]?
 
     struct IPAMSummary: Decodable {
         var Config: [Pool]?
