@@ -1,4 +1,5 @@
 mod app;
+mod apple;
 mod compose;
 mod docker;
 mod files;
@@ -88,6 +89,12 @@ fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &mpsc::Receiv
         if let Some(mut command) = app.shell.take() {
             ratatui::restore();
             let status = command.status();
+            // Apple's `container exec -it` exits with the terminal left non-blocking, and the next read or
+            // write fails with EAGAIN. Its own open of /dev/tty instead breaks crossterm's kqueue.
+            for fd in 0..=2 {
+                // SAFETY: fcntl on the process's standard descriptors only reads and sets file status flags.
+                unsafe { libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) & !libc::O_NONBLOCK) };
+            }
             // Exit codes 125 to 127 are docker's own: no such container, no shell in the image.
             if status.as_ref().is_ok_and(|status| matches!(status.code(), Some(125..=127))) {
                 eprintln!("\nPress Enter to return to dockwatch.");

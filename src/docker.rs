@@ -1,3 +1,4 @@
+use crate::apple;
 use crate::files::{self, FileEntry};
 use crate::http::{Connection, Error, Head, Result, Stream};
 use serde_json::{Value, json};
@@ -54,13 +55,8 @@ pub struct Network {
     pub driver: String,
     pub subnet: String,
     pub project: Option<String>,
-}
-
-impl Network {
-    /// Docker creates these itself and refuses to remove them.
-    pub fn is_system(&self) -> bool {
-        matches!(self.name.as_str(), "bridge" | "host" | "none")
-    }
+    /// The runtime creates it itself and refuses to remove it.
+    pub system: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -101,14 +97,21 @@ pub struct Engine {
 }
 
 /// Docker Engine API client over a Unix socket. Paths carry no API version, so the daemon
-/// answers in its own latest one.
+/// answers in its own latest one. With `apple::SOCKET` every call goes to Apple's `container` CLI.
 #[derive(Clone, Debug)]
 pub struct Docker {
     pub socket: String,
 }
 
 impl Docker {
+    fn apple(&self) -> bool {
+        self.socket == apple::SOCKET
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot> {
+        if self.apple() {
+            return apple::snapshot();
+        }
         let (containers, images, networks, volumes) = thread::scope(|scope| {
             let containers = scope.spawn(|| self.get("/containers/json?all=1"));
             let images = scope.spawn(|| self.get("/images/json"));
@@ -130,6 +133,9 @@ impl Docker {
     }
 
     pub fn engine(&self) -> Result<Engine> {
+        if self.apple() {
+            return apple::engine();
+        }
         let info = self.get("/info")?;
         let version = self.get("/version")?;
         Ok(Engine {
@@ -145,6 +151,9 @@ impl Docker {
     }
 
     pub fn ping(&self) -> Result<()> {
+        if self.apple() {
+            return apple::ping();
+        }
         let body = self.request_with_timeout("GET", "/_ping", None, Duration::from_secs(2))?;
         if body != b"OK" {
             return Err(Error::new("The socket answered, but not as Docker."));
@@ -154,29 +163,47 @@ impl Docker {
 
     /// `action` is `start`, `stop`, `restart`, `pause` or `unpause`.
     pub fn container_action(&self, id: &str, action: &str) -> Result<()> {
+        if self.apple() {
+            return apple::container_action(id, action);
+        }
         self.request_with_timeout("POST", &format!("/containers/{id}/{action}"), None, LONG_REQUEST).map(drop)
     }
 
     /// Volumes always stay: `v=0`.
     pub fn remove_container(&self, id: &str, force: bool) -> Result<()> {
+        if self.apple() {
+            return apple::remove_container(id, force);
+        }
         self.request("DELETE", &format!("/containers/{id}?force={}&v=0", force as u8), None).map(drop)
     }
 
     /// Removing by `name:tag` untags; the image goes once its last tag does.
     pub fn remove_image(&self, reference: &str) -> Result<()> {
+        if self.apple() {
+            return apple::remove("image", reference);
+        }
         self.request("DELETE", &format!("/images/{}", escape(reference)), None).map(drop)
     }
 
     pub fn remove_network(&self, id: &str) -> Result<()> {
+        if self.apple() {
+            return apple::remove("network", id);
+        }
         self.request("DELETE", &format!("/networks/{id}"), None).map(drop)
     }
 
     pub fn remove_volume(&self, name: &str) -> Result<()> {
+        if self.apple() {
+            return apple::remove("volume", name);
+        }
         self.request("DELETE", &format!("/volumes/{}", escape(name)), None).map(drop)
     }
 
     /// Removes every image no container uses, like `docker image prune -a`. Returns bytes reclaimed.
     pub fn prune_images(&self) -> Result<u64> {
+        if self.apple() {
+            return apple::prune_images();
+        }
         let filters = escape(r#"{"dangling":["false"]}"#);
         let body = self.request_with_timeout("POST", &format!("/images/prune?filters={filters}"), None, LONG_REQUEST)?;
         Ok(parse(&body)?["SpaceReclaimed"].as_u64().unwrap_or(0))
@@ -184,44 +211,71 @@ impl Docker {
 
     /// Returns how many networks were removed.
     pub fn prune_networks(&self) -> Result<usize> {
+        if self.apple() {
+            return apple::prune_networks();
+        }
         Ok(array(&self.post_json("/networks/prune")?["NetworksDeleted"]).len())
     }
 
     /// Anonymous volumes only, like `docker volume prune` without `-a`. Returns bytes reclaimed.
     /// Before API 1.42 an unfiltered prune also removed named volumes; those daemons reject `all`.
     pub fn prune_volumes(&self) -> Result<u64> {
+        if self.apple() {
+            return apple::prune_volumes();
+        }
         let filters = escape(r#"{"all":["false"]}"#);
         let body = self.request_with_timeout("POST", &format!("/volumes/prune?filters={filters}"), None, LONG_REQUEST)?;
         Ok(parse(&body)?["SpaceReclaimed"].as_u64().unwrap_or(0))
     }
 
     pub fn inspect_container(&self, id: &str) -> Result<Value> {
+        if self.apple() {
+            return apple::inspect("", id);
+        }
         self.get(&format!("/containers/{id}/json"))
     }
 
     pub fn inspect_image(&self, reference: &str) -> Result<Value> {
+        if self.apple() {
+            return apple::inspect("image", reference);
+        }
         self.get(&format!("/images/{}/json", escape(reference)))
     }
 
-    pub fn image_history(&self, id: &str) -> Result<Value> {
-        self.get(&format!("/images/{}/history", escape(id)))
+    pub fn image_history(&self, reference: &str) -> Result<Value> {
+        if self.apple() {
+            return apple::image_history(reference);
+        }
+        self.get(&format!("/images/{}/history", escape(reference)))
     }
 
     pub fn inspect_network(&self, id: &str) -> Result<Value> {
+        if self.apple() {
+            return apple::inspect("network", id);
+        }
         self.get(&format!("/networks/{id}"))
     }
 
     pub fn inspect_volume(&self, name: &str) -> Result<Value> {
+        if self.apple() {
+            return apple::inspect("volume", name);
+        }
         self.get(&format!("/volumes/{}", escape(name)))
     }
 
     pub fn top(&self, id: &str) -> Result<Value> {
+        if self.apple() {
+            return apple::top(id);
+        }
         self.get(&format!("/containers/{id}/top"))
     }
 
     /// Runs `command` without a TTY and waits for it to exit. No shell: arguments pass as they are.
     /// A command missing from the image fails with 126 or 127, its message in the output.
     pub fn exec(&self, id: &str, command: &[&str]) -> Result<(Vec<u8>, Vec<u8>)> {
+        if self.apple() {
+            return apple::exec(id, command);
+        }
         let create = json!({"AttachStdout": true, "AttachStderr": true, "Cmd": command}).to_string();
         let created = self.request("POST", &format!("/containers/{id}/exec"), Some(("application/json", create.as_bytes())))?;
         let exec_id = text(&parse(&created)?["Id"]);
@@ -273,6 +327,9 @@ impl Docker {
     /// Container, image, network and volume events, except the exec ones every healthcheck run
     /// sends; `on_end` runs once the runtime goes away.
     pub fn events(&self, mut on_event: impl FnMut() + Send + 'static, on_end: impl FnOnce(Option<Error>) + Send + 'static) -> Stream {
+        if self.apple() {
+            return apple::events(on_event, on_end);
+        }
         let filters = escape(r#"{"type":["container","image","network","volume"]}"#);
         let on_data = move |chunk: &[u8], _: &str| {
             if !only_exec_events(chunk) {
@@ -284,11 +341,17 @@ impl Docker {
 
     /// Last `tail` lines, then follows. Each line starts with Docker's timestamp.
     pub fn logs(&self, id: &str, tail: usize, on_data: impl FnMut(&[u8], &str) + Send + 'static, on_end: impl FnOnce(Option<Error>) + Send + 'static) -> Stream {
+        if self.apple() {
+            return apple::logs(id, tail, on_data, on_end);
+        }
         self.stream(&format!("/containers/{id}/logs?follow=1&stdout=1&stderr=1&timestamps=1&tail={tail}"), on_data, on_end)
     }
 
     /// One JSON reading per line, about one per second.
     pub fn stats(&self, id: &str, on_data: impl FnMut(&[u8], &str) + Send + 'static, on_end: impl FnOnce(Option<Error>) + Send + 'static) -> Stream {
+        if self.apple() {
+            return apple::stats(id, on_data, on_end);
+        }
         self.stream(&format!("/containers/{id}/stats?stream=1"), on_data, on_end)
     }
 
@@ -355,15 +418,15 @@ fn parse(body: &[u8]) -> Result<Value> {
     serde_json::from_slice(body).map_err(|error| Error::new(format!("Docker sent JSON this app cannot read: {error}")))
 }
 
-fn text(value: &Value) -> String {
+pub(crate) fn text(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_string()
 }
 
-fn array(value: &Value) -> &[Value] {
+pub(crate) fn array(value: &Value) -> &[Value] {
     value.as_array().map(Vec::as_slice).unwrap_or_default()
 }
 
-fn label(summary: &Value, name: &str) -> Option<String> {
+pub(crate) fn label(summary: &Value, name: &str) -> Option<String> {
     summary["Labels"][name].as_str().map(String::from)
 }
 
@@ -441,6 +504,7 @@ fn network_from_summary(summary: &Value) -> Network {
         driver: text(&summary["Driver"]),
         subnet: text(&summary["IPAM"]["Config"][0]["Subnet"]),
         project: label(summary, "com.docker.compose.project"),
+        system: matches!(summary["Name"].as_str(), Some("bridge" | "host" | "none")),
     }
 }
 

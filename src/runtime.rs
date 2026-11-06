@@ -1,3 +1,5 @@
+use crate::apple;
+use crate::compose;
 use crate::docker::Docker;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -19,7 +21,7 @@ impl Runtime {
     }
 }
 
-const KNOWN_SOCKETS: [(&str, &str); 8] = [
+const KNOWN_SOCKETS: [(&str, &str); 10] = [
     ("Docker Desktop", "~/.docker/run/docker.sock"),
     ("OrbStack", "~/.orbstack/run/docker.sock"),
     ("Lighter", "~/.lighter/docker.sock"),
@@ -27,15 +29,22 @@ const KNOWN_SOCKETS: [(&str, &str); 8] = [
     ("Colima", "~/.config/colima/default/docker.sock"),
     ("Rancher Desktop", "~/.rd/docker.sock"),
     ("Lima", "~/.lima/docker/sock/docker.sock"),
+    ("socktainer", "~/.socktainer/container.sock"),
+    // `brew services start socktainer` runs it with this HOME.
+    ("socktainer", "/opt/homebrew/var/run/socktainer/.socktainer/container.sock"),
     ("Docker", "/var/run/docker.sock"),
 ];
 
-/// Runtimes from `DOCKER_HOST`, every Docker context and the known socket paths, each pinged.
+/// Runtimes from `DOCKER_HOST`, every Docker context, the known socket paths and Apple's `container`
+/// CLI, each pinged.
 pub fn discover() -> Vec<Runtime> {
     let home = std::env::var("HOME").unwrap_or_default();
     let docker_host = std::env::var("DOCKER_HOST").ok();
     let (contexts, current) = read_contexts(&home);
     let mut runtimes = candidates(&home, docker_host.as_deref(), &contexts, current.as_deref(), |path| Path::new(path).exists());
+    if cfg!(target_os = "macos") && compose::find_binary("container").is_some() {
+        runtimes.push(Runtime { name: "Apple container".into(), socket: apple::SOCKET.into(), error: None, current: false });
+    }
     thread::scope(|scope| {
         for runtime in &mut runtimes {
             scope.spawn(|| runtime.error = Docker { socket: runtime.socket.clone() }.ping().err().map(|error| error.message));

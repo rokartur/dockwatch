@@ -410,7 +410,7 @@ impl App {
     }
 
     pub fn network_used(&self, network: &Network) -> bool {
-        network.is_system() || self.snapshot.containers.iter().any(|container| container.networks.contains(&network.name))
+        network.system || self.snapshot.containers.iter().any(|container| container.networks.contains(&network.name))
     }
 
     /// The header of an image, volume or network's Inspect tab: the containers that use it, then a blank line.
@@ -771,7 +771,9 @@ impl App {
                     if !env {
                         return Ok(pretty(&inspect));
                     }
-                    let mut lines: Vec<String> = inspect["Config"]["Env"].as_array().into_iter().flatten().filter_map(|entry| entry.as_str().map(String::from)).collect();
+                    // The second is where Apple's container keeps it.
+                    let env = inspect["Config"]["Env"].as_array().or(inspect["configuration"]["initProcess"]["environment"].as_array());
+                    let mut lines: Vec<String> = env.into_iter().flatten().filter_map(|entry| entry.as_str().map(String::from)).collect();
                     lines.sort();
                     Ok(lines)
                 });
@@ -783,7 +785,7 @@ impl App {
                 let used_by = self.used_by(|container| container.image_id == image.id);
                 self.fetch(move |docker| {
                     if tab == Tab::History {
-                        return history_lines(&docker.image_history(&image.id)?);
+                        return history_lines(&docker.image_history(&image.reference)?);
                     }
                     Ok([used_by, pretty(&docker.inspect_image(&image.reference)?)].concat())
                 });
@@ -1125,14 +1127,14 @@ impl App {
         }
     }
 
-    /// Through the docker CLI, so a private registry gets the login stored in its credential helper.
+    /// Through the runtime's CLI, so a private registry gets the login stored in its credential helper.
     fn pull(&mut self, reference: String) {
         let Some(socket) = self.docker.as_ref().map(|docker| docker.socket.clone()) else { return self.fail("Pull", "No Docker runtime is connected.".into()) };
-        let mut command = match compose::docker_cli(&socket) {
+        let mut command = match compose::cli(&socket) {
             Ok(command) => command,
             Err(message) => return self.fail("Pull", message),
         };
-        command.args(["pull", &reference]);
+        command.args(["image", "pull", &reference]);
         self.spawn(format!("Pull {reference}"), move |_| compose::run(command).map(|_| Some(format!("Pulled {reference}."))).map_err(Error::new));
     }
 
@@ -1144,7 +1146,7 @@ impl App {
         let (Some(socket), Some(id), Some(entry)) = (socket, id, entry) else {
             return self.notify("Select a file in the Files tab to save it.", true);
         };
-        let mut command = match compose::docker_cli(&socket) {
+        let mut command = match compose::cli(&socket) {
             Ok(command) => command,
             Err(message) => return self.fail("Save", message),
         };
@@ -1169,7 +1171,7 @@ impl App {
         if std::fs::symlink_metadata(&source).is_err() {
             return self.fail("Upload", format!("{source} does not exist."));
         }
-        let mut command = match compose::docker_cli(&socket) {
+        let mut command = match compose::cli(&socket) {
             Ok(command) => command,
             Err(message) => return self.fail("Upload", message),
         };
@@ -1264,8 +1266,8 @@ impl App {
             }
             Panel::Networks => {
                 let Some(network) = self.selected_network().cloned() else { return };
-                if network.is_system() {
-                    return self.fail("Remove network", format!("{} belongs to Docker and cannot be removed.", network.name));
+                if network.system {
+                    return self.fail("Remove network", format!("{} belongs to the runtime and cannot be removed.", network.name));
                 }
                 self.confirm(format!("Remove network {}?", network.name), "Docker refuses while a container is attached.".into(), format!("Remove {}", network.name), move |docker| {
                     docker.remove_network(&network.id).map(|_| None)
@@ -1317,7 +1319,7 @@ impl App {
             return self.notify(format!("Start {} to open a shell.", container.name), true);
         }
         let id = container.id.clone();
-        match compose::docker_cli(&docker.socket) {
+        match compose::cli(&docker.socket) {
             Ok(mut command) => {
                 command.args(["exec", "-it", &id, "sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"]);
                 // Closes the view's streams, so a busy log does not pile up while the shell runs; tick reopens it.
@@ -1438,7 +1440,7 @@ fn history_lines(history: &Value) -> Result<Vec<String>> {
     for layer in history.as_array().into_iter().flatten() {
         let size = stats::format_bytes(layer["Size"].as_u64().unwrap_or(0));
         let created = stats::age(layer["Created"].as_i64().unwrap_or(0));
-        let command = layer["CreatedBy"].as_str().unwrap_or_default().replace("/bin/sh -c #(nop) ", "").replace("/bin/sh -c ", "RUN ");
+        let command = layer["CreatedBy"].as_str().unwrap_or_default().replace("/bin/sh -c #(nop) ", "").replace("RUN /bin/sh -c ", "RUN ").replace("/bin/sh -c ", "RUN ");
         lines.push(format!("{size:>10}  {created:>4}  {}", logs::strip_ansi(command.trim())));
     }
     Ok(lines)
@@ -1580,5 +1582,14 @@ mod tests {
     fn previews_text_and_flags_binary() {
         assert_eq!(preview_lines(b"a\nb\n"), ["a", "b"]);
         assert_eq!(preview_lines(b"\x7fELF\0\0"), ["Binary file, 6 B."]);
+    }
+
+    #[test]
+    fn history_shows_one_run_for_classic_and_buildkit_layers() {
+        let history = serde_json::json!([{"CreatedBy": "/bin/sh -c apk add curl"}, {"CreatedBy": "RUN /bin/sh -c apk add git # buildkit"}, {"CreatedBy": "/bin/sh -c #(nop)  CMD [\"sh\"]"}]);
+        let lines = history_lines(&history).unwrap();
+        assert!(lines[0].ends_with("  RUN apk add curl"), "{}", lines[0]);
+        assert!(lines[1].ends_with("  RUN apk add git # buildkit"), "{}", lines[1]);
+        assert!(lines[2].ends_with("  CMD [\"sh\"]"), "{}", lines[2]);
     }
 }

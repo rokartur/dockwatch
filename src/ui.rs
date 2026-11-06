@@ -344,8 +344,8 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     let mut rows: Vec<Line> = Vec::new();
     for line in shown[..end].iter().rev() {
         let mut prefix = Vec::new();
-        if app.timestamps {
-            // Docker stamps lines in UTC.
+        // Docker stamps lines in UTC; Apple's container CLI does not stamp them.
+        if app.timestamps && !line.timestamp.is_empty() {
             prefix.push(Span::styled(format!("{}Z ", line.time()), DIM));
         }
         if let Some(source) = &line.source {
