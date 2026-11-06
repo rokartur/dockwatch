@@ -1,7 +1,8 @@
+use crate::apple;
 use crate::docker::Container;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -101,7 +102,10 @@ pub fn command(socket: &str, project: &Project, args: &[&str]) -> Result<Command
     if files.is_empty() {
         return Err(format!("No compose file is known for {}. Run dockwatch in its folder.", project.name));
     }
-    let mut command = docker_cli(socket)?;
+    if socket == apple::SOCKET {
+        return Err("Apple container has no compose. Run socktainer and pick its runtime to manage compose projects.".into());
+    }
+    let mut command = cli(socket)?;
     command.args(["compose", "-p", &project.name]);
     if let Some(folder) = &project.working_dir {
         command.args(["--project-directory", folder]);
@@ -115,20 +119,10 @@ pub fn command(socket: &str, project: &Project, args: &[&str]) -> Result<Command
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// Runs a docker CLI command to its end, at most 30 minutes; a failure carries the last lines of its output.
-pub fn run(mut command: Command) -> Result<(), String> {
+/// Runs a CLI command to its end, at most 30 minutes; a failure carries the last lines of its output.
+pub fn run(command: Command) -> Result<(), String> {
     let program = Path::new(command.get_program()).file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Cannot run {program}: {error}"))?;
-    let pid = child.id();
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || tx.send(child.wait_with_output()));
-    let output = match rx.recv_timeout(RUN_TIMEOUT) {
-        Ok(output) => output.map_err(|error| format!("Cannot run {program}: {error}"))?,
-        Err(_) => {
-            let _ = Command::new("kill").arg(pid.to_string()).status();
-            return Err(format!("{program} did not finish in 30 minutes."));
-        }
-    };
+    let output = output(command, RUN_TIMEOUT)?;
     if output.status.success() {
         return Ok(());
     }
@@ -141,28 +135,47 @@ pub fn run(mut command: Command) -> Result<(), String> {
     Err(lines[lines.len().saturating_sub(15)..].join("\n"))
 }
 
-/// The docker CLI talking to `socket`, whatever context the shell has. `DOCKWATCH_DOCKER` names the
-/// binary when it is somewhere unusual.
-pub fn docker_cli(socket: &str) -> Result<Command, String> {
+/// Waits at most `timeout`, then kills the command. Any exit status is returned as output.
+pub fn output(mut command: Command, timeout: Duration) -> Result<Output, String> {
+    let program = Path::new(command.get_program()).file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| format!("Cannot run {program}: {error}"))?;
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || tx.send(child.wait_with_output()));
+    match rx.recv_timeout(timeout) {
+        Ok(output) => output.map_err(|error| format!("Cannot run {program}: {error}")),
+        Err(_) => {
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+            Err(format!("{program} did not finish in {} seconds.", timeout.as_secs()))
+        }
+    }
+}
+
+/// The CLI of the runtime at `socket`: Apple's `container`, else the docker CLI talking to `socket`,
+/// whatever context the shell has. `DOCKWATCH_DOCKER` names the docker binary when it is somewhere unusual.
+/// `exec -it`, `cp` and `image pull` take the same arguments in both.
+pub fn cli(socket: &str) -> Result<Command, String> {
+    if socket == apple::SOCKET {
+        return find_binary("container").map(Command::new).ok_or("The container CLI is not installed or not on PATH.".into());
+    }
     let binary = match std::env::var_os("DOCKWATCH_DOCKER") {
         Some(binary) => PathBuf::from(binary),
-        None => find_docker()?,
+        None => find_binary("docker").ok_or("The docker CLI is not installed or not on PATH. Set DOCKWATCH_DOCKER to its path.")?,
     };
     let mut command = Command::new(binary);
     command.env("DOCKER_HOST", format!("unix://{socket}")).env_remove("DOCKER_CONTEXT");
     Ok(command)
 }
 
-fn find_docker() -> Result<PathBuf, String> {
+pub fn find_binary(name: &str) -> Option<PathBuf> {
     let home = std::env::var("HOME").unwrap_or_default();
     let path = std::env::var("PATH").unwrap_or_default();
     let extra = ["/opt/homebrew/bin", "/usr/local/bin", &format!("{home}/.orbstack/bin"), &format!("{home}/.rd/bin"), "/Applications/Docker.app/Contents/Resources/bin"].map(String::from);
     path.split(':')
         .map(String::from)
         .chain(extra)
-        .map(|folder| PathBuf::from(folder).join("docker"))
+        .map(|folder| PathBuf::from(folder).join(name))
         .find(|candidate| candidate.metadata().is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0))
-        .ok_or("The docker CLI is not installed or not on PATH. Set DOCKWATCH_DOCKER to its path.".into())
 }
 
 #[cfg(test)]

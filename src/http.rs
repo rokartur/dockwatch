@@ -2,6 +2,7 @@ use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -164,13 +165,15 @@ fn closed(error: io::Error) -> Error {
     if error.kind() == io::ErrorKind::UnexpectedEof { Error::new("Docker closed the connection") } else { error.into() }
 }
 
-/// A long-lived response read on its own thread; dropping it closes the socket, which ends the thread.
+/// A long-lived response, process or poll on its own thread; dropping it closes the socket or kills
+/// the process, which ends the thread.
 pub struct Stream(Arc<Mutex<StreamSocket>>);
 
 #[derive(Default)]
 struct StreamSocket {
     closed: bool,
     socket: Option<UnixStream>,
+    child: Option<Child>,
 }
 
 impl Stream {
@@ -192,6 +195,64 @@ impl Stream {
         });
         stream
     }
+
+    /// Runs `command` and passes its stdout on as it comes. `on_end` gets its stderr when it fails,
+    /// and is not called once the stream is dropped.
+    pub fn process(mut command: Command, mut on_data: impl FnMut(&[u8]) + Send + 'static, on_end: impl FnOnce(Option<Error>) + Send + 'static) -> Stream {
+        let shared = Arc::new(Mutex::new(StreamSocket::default()));
+        let stream = Stream(shared.clone());
+        thread::spawn(move || {
+            let result = (|| {
+                let program = command.get_program().to_string_lossy().into_owned();
+                let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|error| Error::new(format!("Cannot run {program}: {error}")))?;
+                let (mut stdout, mut stderr) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+                {
+                    let mut shared = shared.lock().unwrap();
+                    if shared.closed {
+                        let _ = child.kill();
+                    }
+                    shared.child = Some(child);
+                }
+                let mut buffer = [0; 16 * 1024];
+                loop {
+                    let read = stdout.read(&mut buffer)?;
+                    if read == 0 {
+                        break;
+                    }
+                    on_data(&buffer[..read]);
+                }
+                let mut errors = String::new();
+                stderr.read_to_string(&mut errors)?;
+                let status = shared.lock().unwrap().child.as_mut().unwrap().wait()?;
+                if status.success() {
+                    return Ok(());
+                }
+                Err(Error::new(errors.lines().last().unwrap_or("The process ended.").trim().to_string()))
+            })();
+            if !shared.lock().unwrap().closed {
+                on_end(result.err());
+            }
+        });
+        stream
+    }
+
+    /// Calls `tick` every `every` until it fails or the stream is dropped; `on_end` gets the failure.
+    pub fn poll(every: Duration, mut tick: impl FnMut() -> Result<()> + Send + 'static, on_end: impl FnOnce(Error) + Send + 'static) -> Stream {
+        let shared = Arc::new(Mutex::new(StreamSocket::default()));
+        let stream = Stream(shared.clone());
+        thread::spawn(move || {
+            while !shared.lock().unwrap().closed {
+                if let Err(error) = tick() {
+                    if !shared.lock().unwrap().closed {
+                        on_end(error);
+                    }
+                    return;
+                }
+                thread::sleep(every);
+            }
+        });
+        stream
+    }
 }
 
 impl Drop for Stream {
@@ -200,6 +261,10 @@ impl Drop for Stream {
         shared.closed = true;
         if let Some(socket) = &shared.socket {
             let _ = socket.shutdown(Shutdown::Both);
+        }
+        if let Some(child) = &mut shared.child {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

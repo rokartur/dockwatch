@@ -314,6 +314,7 @@ dependencies = [
 name = "dockwatch"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ratatui",
  "serde_json",
  "unicode-width",
