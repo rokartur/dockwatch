@@ -1,0 +1,106 @@
+mod app;
+mod compose;
+mod docker;
+mod files;
+mod http;
+mod logs;
+mod runtime;
+mod settings;
+mod stats;
+mod ui;
+mod update;
+
+use app::App;
+use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use std::sync::mpsc;
+use std::time::Duration;
+
+fn main() -> std::io::Result<()> {
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("--version") => {
+            println!("dockwatch {}", update::CURRENT);
+            return Ok(());
+        }
+        Some("update") => {
+            if let Err(message) = update_command() {
+                eprintln!("dockwatch: {message}");
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        Some(_) => {
+            eprintln!("Usage: dockwatch [update | --version]");
+            std::process::exit(2);
+        }
+    }
+    let local = std::env::current_dir().ok().and_then(|folder| compose::local_project(&folder));
+    let (tx, rx) = mpsc::channel();
+    if update::enabled() {
+        update_in_background(tx.clone());
+    }
+    let mut app = App::new(tx, local);
+    let mut terminal = ratatui::init();
+    let result = run(&mut terminal, &mut app, &rx);
+    ratatui::restore();
+    result
+}
+
+fn update_command() -> Result<(), String> {
+    if !update::enabled() {
+        return Err("Only release builds update themselves. Rebuild from source instead.".into());
+    }
+    let Some(latest) = update::newer_release()? else {
+        println!("dockwatch v{} is up to date.", update::CURRENT);
+        return Ok(());
+    };
+    println!("Downloading v{latest}...");
+    update::install(&latest)?;
+    println!("Updated to v{latest}.");
+    Ok(())
+}
+
+/// An offline start is normal, so only a failed install of a found release is shown.
+fn update_in_background(tx: mpsc::Sender<app::Msg>) {
+    std::thread::spawn(move || {
+        let Ok(Some(latest)) = update::newer_release() else { return };
+        let result = update::install(&latest).map(|()| Some(format!("Updated to v{latest}. Restart dockwatch to use it."))).map_err(http::Error::new);
+        let _ = tx.send(app::Msg::Done("Update".into(), result));
+    });
+}
+
+fn run(terminal: &mut ratatui::DefaultTerminal, app: &mut App, rx: &mpsc::Receiver<app::Msg>) -> std::io::Result<()> {
+    while !app.quit {
+        app.tick();
+        terminal.draw(|frame| ui::draw(frame, app))?;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => app.key(key),
+                Event::Resize(..) => {}
+                _ => continue,
+            }
+        }
+        while let Ok(msg) = rx.try_recv() {
+            app.handle(msg);
+        }
+        if let Some(mut command) = app.shell.take() {
+            ratatui::restore();
+            let status = command.status();
+            // Exit codes 125 to 127 are docker's own: no such container, no shell in the image.
+            if status.as_ref().is_ok_and(|status| matches!(status.code(), Some(125..=127))) {
+                eprintln!("\nPress Enter to return to dockwatch.");
+                let _ = std::io::stdin().read_line(&mut String::new());
+            }
+            // ratatui::init would install one more panic hook per shell.
+            enable_raw_mode()?;
+            execute!(std::io::stdout(), EnterAlternateScreen)?;
+            terminal.clear()?;
+            if let Err(error) = status {
+                app.shell_failed(format!("Cannot run docker exec: {error}"));
+            }
+        }
+    }
+    Ok(())
+}
