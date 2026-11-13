@@ -462,16 +462,25 @@ fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
     let width = (area.width as usize).max(1);
     let mut rows = Vec::new();
     for line in lines.iter().filter(|line| query.is_empty() || line.to_lowercase().contains(&query)) {
-        for piece in wrap(line, width, width) {
-            rows.push(piece);
+        for (index, piece) in wrap(line, width, width).into_iter().enumerate() {
+            rows.push((piece, index == 0));
         }
     }
     if rows.is_empty() {
         return placeholder(frame, area, "No line matches the filter.");
     }
     app.view.scroll = app.view.scroll.min(rows.len().saturating_sub(area.height as usize));
-    let inspect = app.tab() == Tab::Inspect;
-    let visible: Vec<Line> = rows.into_iter().skip(app.view.scroll).take(area.height as usize).map(|row| if inspect { json_line(row) } else { Line::from(row) }).collect();
+    let tab = app.tab();
+    let visible: Vec<Line> = rows
+        .into_iter()
+        .skip(app.view.scroll)
+        .take(area.height as usize)
+        .map(|(row, first)| match tab {
+            Tab::Inspect => json_line(row),
+            Tab::Env if first => env_line(row),
+            _ => Line::from(row),
+        })
+        .collect();
     frame.render_widget(Paragraph::new(visible), area);
 }
 
@@ -480,6 +489,13 @@ fn json_line(row: String) -> Line<'static> {
     match row.split_once("\": ") {
         Some((key, value)) if key.trim_start().starts_with('"') => Line::from(vec![Span::styled(format!("{key}\":"), KEY), Span::raw(format!(" {value}"))]),
         _ => Line::from(row),
+    }
+}
+
+fn env_line(row: String) -> Line<'static> {
+    match row.split_once('=') {
+        Some((key, value)) => Line::from(vec![Span::styled(key.to_string(), KEY), Span::styled("=", DIM), Span::raw(value.to_string())]),
+        None => Line::from(row),
     }
 }
 
@@ -593,6 +609,14 @@ fn hint_line(hints: &[(&str, &str)]) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colors_the_env_key_up_to_the_first_equals_sign() {
+        let line = env_line("DATABASE_URL=postgres://a?b=c".into());
+        let spans: Vec<_> = line.spans.iter().map(|span| (span.content.to_string(), span.style)).collect();
+        assert_eq!(spans, vec![("DATABASE_URL".into(), KEY), ("=".into(), DIM), ("postgres://a?b=c".into(), Style::new())]);
+        assert_eq!(env_line("no equals".into()).spans.len(), 1);
+    }
 
     #[test]
     fn marks_the_active_tab_while_the_main_panel_has_focus() {
