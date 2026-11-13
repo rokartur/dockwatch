@@ -7,6 +7,7 @@ mod http;
 mod logs;
 mod runtime;
 mod settings;
+mod spinner;
 mod stats;
 mod ui;
 mod update;
@@ -15,6 +16,7 @@ use app::App;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use std::io::IsTerminal;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -53,22 +55,48 @@ fn update_command() -> Result<(), String> {
     if !update::enabled() {
         return Err("Only release builds update themselves. Rebuild from source instead.".into());
     }
-    let Some(latest) = update::newer_release()? else {
-        println!("dockwatch v{} is up to date.", update::CURRENT);
-        return Ok(());
-    };
-    println!("Downloading v{latest}...");
-    update::install(&latest)?;
-    println!("Updated to v{latest}.");
+    // `off` only stops the automatic check, so an explicit update with it follows stable releases.
+    let channel = settings::load().update_channel;
+    let progress = spinner::Spinner::start();
+    let download_started = std::cell::OnceCell::new();
+    let installed = update::install_now(&channel, &|step| match step {
+        update::Progress::Checking => progress.set("Check for updates", String::new(), String::new()),
+        update::Progress::Downloading { version, received, total } => {
+            let elapsed = download_started.get_or_init(std::time::Instant::now).elapsed();
+            progress.set(&format!("Download v{version}"), spinner::transfer(received, total, elapsed), spinner::mib(received));
+        }
+        update::Progress::Verifying => progress.set("Verify the download", String::new(), String::new()),
+        update::Progress::Installing => progress.set("Replace the binary", String::new(), String::new()),
+    });
+    progress.finish(installed.is_ok());
+    let styled = std::io::stdout().is_terminal();
+    let current = update::CURRENT;
+    match installed? {
+        Some(version) => println!(
+            "\n{} {} → {}  {}",
+            paint(styled, spinner::BOLD, "dockwatch"),
+            paint(styled, spinner::DIM, &format!("v{current}")),
+            paint(styled, &format!("{}{}", spinner::BOLD, spinner::GREEN), &format!("v{version}")),
+            paint(styled, spinner::DIM, &format!("{}/tag/v{version}", update::RELEASES)),
+        ),
+        None => println!("\n{} {} is up to date.", paint(styled, spinner::BOLD, "dockwatch"), paint(styled, spinner::GREEN, &format!("v{current}"))),
+    }
     Ok(())
 }
 
-/// An offline start is normal, so only a failed install of a found release is shown.
+fn paint(styled: bool, style: &str, text: &str) -> String {
+    if styled { format!("{style}{text}{}", spinner::RESET) } else { text.to_string() }
+}
+
 fn update_in_background(tx: mpsc::Sender<app::Msg>) {
+    let channel = settings::load().update_channel;
     std::thread::spawn(move || {
-        let Ok(Some(latest)) = update::newer_release() else { return };
-        let result = update::install(&latest).map(|()| Some(format!("Updated to v{latest}. Restart dockwatch to use it."))).map_err(http::Error::new);
-        let _ = tx.send(app::Msg::Done("Update".into(), result));
+        let (text, error) = match update::install_latest(&settings::update_stamp(), &channel) {
+            Ok(Some(version)) => (format!("Updated to v{version}. Restart dockwatch to use it."), false),
+            Ok(None) => return,
+            Err(error) => (format!("Update failed: {error}"), true),
+        };
+        let _ = tx.send(app::Msg::Notice(text, error));
     });
 }
 

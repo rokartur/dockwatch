@@ -2,11 +2,13 @@ use serde_json::{Value, json};
 use std::path::PathBuf;
 
 /// What dockwatch remembers between launches, in `~/.config/dockwatch/settings.json`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub runtime: Option<String>,
     /// The "only running" and "only unused" toggles, per panel.
     pub narrow: Vec<bool>,
+    /// One of `update::CHANNELS`, set by hand in the file.
+    pub update_channel: String,
 }
 
 // Tests build `App`s that load and save settings; keep them off the real home.
@@ -22,10 +24,14 @@ fn path() -> PathBuf {
     config.join("dockwatch/settings.json")
 }
 
+/// When the start-up update check last ran, next to the settings.
+pub fn update_stamp() -> PathBuf {
+    path().with_file_name("update-check")
+}
+
 /// Missing or unreadable settings give the defaults.
 pub fn load() -> Settings {
-    let Ok(bytes) = std::fs::read(path()) else { return Settings::default() };
-    parse(&bytes)
+    parse(&std::fs::read(path()).unwrap_or_default())
 }
 
 fn parse(bytes: &[u8]) -> Settings {
@@ -33,13 +39,14 @@ fn parse(bytes: &[u8]) -> Settings {
     Settings {
         runtime: value["runtime"].as_str().map(String::from),
         narrow: value["narrow"].as_array().map(|flags| flags.iter().map(|flag| flag.as_bool().unwrap_or(false)).collect()).unwrap_or_default(),
+        update_channel: value["update_channel"].as_str().filter(|channel| crate::update::CHANNELS.contains(channel)).unwrap_or("latest").to_string(),
     }
 }
 
 /// Best effort: a read-only home only means the next launch starts from the defaults.
 pub fn save(settings: &Settings) {
     let path = path();
-    let text = json!({"runtime": settings.runtime, "narrow": settings.narrow}).to_string();
+    let text = json!({"runtime": settings.runtime, "narrow": settings.narrow, "update_channel": settings.update_channel}).to_string();
     if let Some(folder) = path.parent() {
         let _ = std::fs::create_dir_all(folder);
     }
@@ -52,8 +59,9 @@ mod tests {
 
     #[test]
     fn reads_what_it_writes_and_defaults_on_garbage() {
-        let settings = parse(br#"{"runtime": "/h/.orbstack/run/docker.sock", "narrow": [false, true]}"#);
-        assert_eq!(settings, Settings { runtime: Some("/h/.orbstack/run/docker.sock".into()), narrow: vec![false, true] });
-        assert_eq!(parse(b"not json"), Settings::default());
+        let settings = parse(br#"{"runtime": "/h/.orbstack/run/docker.sock", "narrow": [false, true], "update_channel": "off"}"#);
+        assert_eq!(settings, Settings { runtime: Some("/h/.orbstack/run/docker.sock".into()), narrow: vec![false, true], update_channel: "off".into() });
+        assert_eq!(parse(b"not json"), Settings { runtime: None, narrow: vec![], update_channel: "latest".into() });
+        assert_eq!(parse(br#"{"update_channel": "nightly"}"#).update_channel, "latest");
     }
 }

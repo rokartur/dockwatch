@@ -53,4 +53,6 @@ jobs:
         # A semver pre-release tag (v0.3.0-beta.1) must stay off releases/latest.
         run: |
           case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; *) prerelease= ;; esac
-          gh release create "$GITHUB_REF_NAME" dockwatch-* --repo "$GITHUB_REPOSITORY" --generate-notes $prerelease
+          # The updater checks a download against this file.
+          sha256sum dockwatch-* > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" dockwatch-* SHA256SUMS --repo "$GITHUB_REPOSITORY" --generate-notes $prerelease

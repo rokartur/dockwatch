@@ -38,7 +38,9 @@ dockwatch --version
 
 Start dockwatch in a folder with a `compose.yaml`. That project then shows in the Projects panel before it has containers, so `u` can create it.
 
-A release build checks GitHub at each start. When it finds a newer release, it installs it in the background, and the new version runs from the next start. A build from source never updates itself.
+A release build checks GitHub once a day, at start. When it finds a newer release, it installs it in the background, and the new version runs from the next start. Before it replaces the binary, it checks the download against the release's `SHA256SUMS`. A build from source never updates itself.
+
+To choose the releases it follows, set `update_channel` in `~/.config/dockwatch/settings.json`: `latest` (the default) takes stable releases, `pre-release` also takes pre-releases, `off` stops the check at start. GitHub limits unauthenticated checks to 60 an hour per IP. With `GH_TOKEN`, `GITHUB_TOKEN` or a `gh` login, dockwatch sends that token and gets 5000.
 
 ## Panels
 

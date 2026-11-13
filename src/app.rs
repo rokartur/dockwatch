@@ -157,6 +157,8 @@ pub enum Msg {
     /// View, file path, lines.
     Preview(u64, String, Result<Vec<String>>),
     Done(String, Result<Option<String>>),
+    /// Text, whether it is an error.
+    Notice(String, bool),
 }
 
 pub enum Content {
@@ -537,7 +539,7 @@ impl App {
     }
 
     fn save_settings(&self) {
-        settings::save(&Settings { runtime: self.chosen.clone(), narrow: self.narrow.to_vec() });
+        settings::save(&Settings { runtime: self.chosen.clone(), narrow: self.narrow.to_vec(), ..settings::load() });
     }
 
     fn connect(&mut self, socket: String) {
@@ -687,6 +689,7 @@ impl App {
                     Err(error) => Content::Failed(error.message),
                 };
             }
+            Msg::Notice(text, error) => self.notify(text, error),
             Msg::Done(label, result) => {
                 if let Some(index) = self.busy.iter().position(|busy| *busy == label) {
                     self.busy.remove(index);
