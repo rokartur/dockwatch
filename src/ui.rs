@@ -184,7 +184,9 @@ fn dot(glyph: &'static str, color: Color) -> Span<'static> {
 }
 
 fn highlight(focused: bool) -> Style {
-    if focused { Style::new().bg(Color::DarkGray).add_modifier(Modifier::BOLD) } else { Style::new().add_modifier(Modifier::BOLD) }
+    // Unfocused keeps a dimmer bar (256-color 236) so the selection stays visible while the main panel has focus.
+    let bar = if focused { Color::DarkGray } else { Color::Indexed(236) };
+    Style::new().bg(bar).add_modifier(Modifier::BOLD)
 }
 
 /// `48.2M   2.3%`, memory and CPU summed over `samples`, in fixed-width columns.
